@@ -61,6 +61,19 @@ internal/dedupe        idempotency-key store (leader/replay)
 internal/telemetry     OpenTelemetry traces + metrics
 ```
 
+## Releases & versioning
+
+mortise uses [Conventional Commits](https://www.conventionalcommits.org/) with
+[release-please](https://github.com/googleapis/release-please) for automated
+semantic versioning. On merge to `main`, release-please maintains a release PR
+that bumps the version and updates `CHANGELOG.md`; merging it tags `vX.Y.Z` and
+creates a GitHub Release. [GoReleaser](https://goreleaser.com) then builds and
+attaches cross-platform binaries. The running version is embedded at build time:
+
+```sh
+mortise -version   # mortise vX.Y.Z (commit <sha>, built <date>)
+```
+
 ## Non-goals
 
 Prompt logic, guardrails, caching beyond dedupe, and any coupling to specific
