@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,9 +19,22 @@ import (
 	"github.com/mrn-dk/mortise/internal/telemetry"
 )
 
+// Build information, injected via -ldflags at release time (see .goreleaser.yaml).
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "mortise.yaml", "path to config file")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("mortise %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -56,7 +70,7 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("mortise listening on %s", cfg.Listen)
+	log.Printf("mortise %s listening on %s", version, cfg.Listen)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("mortise: %v", err)
 	}
