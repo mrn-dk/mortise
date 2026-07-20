@@ -1,0 +1,49 @@
+# GoReleaser configuration. See https://goreleaser.com
+# Runs on tag push (see .github/workflows/release.yml). release-please owns the
+# changelog and GitHub Release; GoReleaser only builds and attaches artifacts.
+version: 2
+
+project_name: mortise
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: mortise
+    main: ./cmd/mortise
+    binary: mortise
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+# release-please already generates the changelog; keep GoReleaser out of it.
+changelog:
+  disable: true
+
+release:
+  # Do not clobber the release-please-created GitHub Release; just add artifacts.
+  mode: keep-existing
