@@ -1,0 +1,52 @@
+# mortise example configuration.
+# A single file drives everything: pools, routes, keys, limits, telemetry.
+
+listen: ":8080"
+
+# Backend pools: named groups of interchangeable OpenAI-compatible endpoints.
+# Requests are tried against a pool's backends in order, failing over on error.
+pools:
+  - name: llama-fleet
+    retries: 2                 # additional attempts across backends (0 = single try)
+    timeout: 60s               # per-attempt timeout
+    backends:
+      - name: vllm-a
+        base_url: http://vllm-a:8000/v1
+        api_key: ""            # credential mortise presents to this backend
+      - name: vllm-b
+        base_url: http://vllm-b:8000/v1
+        # model: meta-llama/Llama-3.1-8B-Instruct  # override model sent upstream
+
+  - name: openai-fallback
+    retries: 1
+    backends:
+      - name: openai
+        base_url: https://api.openai.com/v1
+        api_key: "${OPENAI_API_KEY}"   # note: literal here; expand via env in your deploy
+
+# Model-name routing: map the client-visible model to a pool.
+routes:
+  - model: llama-3.1-8b
+    pool: llama-fleet
+  - model: gpt-4o-mini
+    pool: openai-fallback
+
+# Client API keys with optional per-key limits.
+keys:
+  - name: team-agents
+    key: sk-mortise-abc123
+    rps: 20                    # sustained requests/sec (0 = unlimited)
+    burst: 40                  # token-bucket burst (defaults to ceil(rps))
+    tokens_per_min: 200000     # rolling per-minute token budget (0 = unlimited)
+  - name: readonly
+    key: sk-mortise-xyz789
+    rps: 5
+
+limits:
+  request_timeout: 60s         # default per-attempt timeout when a pool sets none
+  idempotency_ttl: 24h         # how long completed responses are cached for dedup
+
+telemetry:
+  service_name: mortise
+  otlp_endpoint: "localhost:4317"   # empty disables OTLP export
+  insecure: true
