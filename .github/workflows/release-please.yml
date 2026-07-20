@@ -1,0 +1,24 @@
+name: release-please
+
+# Drives semantic versioning from Conventional Commits. On each push to main it
+# maintains a "release PR" that bumps the version and updates CHANGELOG.md.
+# Merging that PR tags the release (vX.Y.Z) and creates a GitHub Release, which
+# in turn triggers the `release` workflow to build and attach binaries.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
