@@ -306,15 +306,15 @@ func TestDocsEndpoints(t *testing.T) {
 	srv := httptest.NewServer(New(cfg, testTel(t)).Handler())
 	defer srv.Close()
 
-	// Spec is served without auth and is non-empty YAML.
-	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	// Spec is served without auth and describes the chat endpoint.
+	resp, err := http.Get(srv.URL + "/openapi.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "openapi:") {
-		t.Fatalf("openapi.yaml: status=%d body=%.40q", resp.StatusCode, b)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "/v1/chat/completions") {
+		t.Fatalf("openapi.json: status=%d body=%.40q", resp.StatusCode, b)
 	}
 
 	// Swagger UI page renders and references the spec.

@@ -1,18 +1,18 @@
 package server
 
 import (
-	_ "embed"
 	"net/http"
+
+	"github.com/mrn-dk/mortise/internal/server/docs"
 )
 
-// openapiSpec is the API description served at /openapi.yaml and rendered by
-// the Swagger UI page at /docs.
+// The OpenAPI spec is generated from the annotations on the handlers (see
+// server.go and apidoc.go) by swaggo/swag. Regenerate after changing them:
 //
-//go:embed openapi.yaml
-var openapiSpec []byte
+//go:generate go run github.com/swaggo/swag/cmd/swag init -g cmd/mortise/main.go -o internal/server/docs --parseInternal
 
-// swaggerUI is a self-contained Swagger UI page that loads the embedded spec
-// from /openapi.yaml. The UI assets are pulled from a CDN at view time.
+// swaggerUI is a self-contained Swagger UI page that loads the generated spec
+// from /openapi.json. The UI assets are pulled from a CDN at view time.
 const swaggerUI = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -28,7 +28,7 @@ const swaggerUI = `<!DOCTYPE html>
   <script>
     window.onload = () => {
       window.ui = SwaggerUIBundle({
-        url: 'openapi.yaml',
+        url: 'openapi.json',
         dom_id: '#swagger-ui',
         deepLinking: true,
         presets: [SwaggerUIBundle.presets.apis],
@@ -41,11 +41,11 @@ const swaggerUI = `<!DOCTYPE html>
 // registerDocs wires the interactive API documentation:
 //
 //	GET /docs         Swagger UI (HTML)
-//	GET /openapi.yaml the raw OpenAPI 3.0 specification
+//	GET /openapi.json the generated OpenAPI specification
 func (s *Server) registerDocs(mux *http.ServeMux) {
-	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-		_, _ = w.Write(openapiSpec)
+	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(docs.SwaggerInfo.ReadDoc()))
 	})
 	mux.HandleFunc("GET /docs", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
