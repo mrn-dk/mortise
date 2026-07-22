@@ -5,9 +5,9 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/mrn-dk/mortise/internal/auth"
@@ -36,18 +36,29 @@ type Server struct {
 	proxy  *proxy.Proxy
 	dedupe *dedupe.Store
 	tel    *telemetry.Telemetry
+
+	maxCacheBody int
+
+	// attrCache memoizes metric attribute sets keyed by (key, pool, result) so
+	// the hot path does not allocate an attribute slice per metric per request.
+	attrCache sync.Map // attrKey -> metric.MeasurementOption
 }
 
 // New constructs a Server.
 func New(cfg *config.Config, tel *telemetry.Telemetry) *Server {
+	maxCacheBody := cfg.Limits.IdempotencyMaxBodyBytes
+	if maxCacheBody <= 0 {
+		maxCacheBody = 4 << 20 // 4 MiB fallback when limits weren't defaulted
+	}
 	return &Server{
-		cfg:    cfg,
-		auth:   auth.New(cfg),
-		limit:  ratelimit.New(cfg),
-		router: router.New(cfg),
-		proxy:  proxy.New(),
-		dedupe: dedupe.NewStore(cfg.Limits.IdempotencyTTL),
-		tel:    tel,
+		cfg:          cfg,
+		auth:         auth.New(cfg),
+		limit:        ratelimit.New(cfg),
+		router:       router.New(cfg),
+		proxy:        proxy.New(),
+		dedupe:       dedupe.NewStore(cfg.Limits.IdempotencyTTL, cfg.Limits.IdempotencyMaxEntries),
+		tel:          tel,
+		maxCacheBody: maxCacheBody,
 	}
 }
 
@@ -87,6 +98,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// reqState bundles the per-request context passed through the pipeline, so the
+// stages don't need long positional parameter lists.
+type reqState struct {
+	span   trace.Span
+	key    *config.Key
+	pool   *config.Pool
+	body   []byte
+	stream bool
+	header http.Header
+	start  time.Time
+}
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctx, span := s.tel.Tracer.Start(r.Context(), "chat.completions")
@@ -95,20 +118,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 1. Ingress auth.
 	key, ok := s.auth.Authenticate(r)
 	if !ok {
-		s.fail(span, w, http.StatusUnauthorized, "invalid api key", "invalid_request_error", "invalid_api_key", nil)
+		s.fail(ctx, span, w, http.StatusUnauthorized, "invalid api key", "invalid_request_error", "invalid_api_key", nil)
 		return
 	}
 	span.SetAttributes(attribute.String("mortise.key", key.Name))
 
 	// 2. Per-key RPS limit.
 	if !s.limit.AllowRequest(key.Key) {
-		s.fail(span, w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_error", "rate_limit_exceeded",
+		s.fail(ctx, span, w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_error", "rate_limit_exceeded",
 			[]attribute.KeyValue{attribute.String("mortise.reject", "rps")})
 		return
 	}
-	// Per-key token budget (checked against the current minute's usage).
+	// Per-key token budget (checked against the current window's usage).
 	if !s.limit.AllowTokens(key.Key) {
-		s.fail(span, w, http.StatusTooManyRequests, "token quota exceeded", "rate_limit_error", "token_quota_exceeded",
+		s.fail(ctx, span, w, http.StatusTooManyRequests, "token quota exceeded", "rate_limit_error", "token_quota_exceeded",
 			[]attribute.KeyValue{attribute.String("mortise.reject", "tokens")})
 		return
 	}
@@ -116,16 +139,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 3. Read + inspect body.
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes))
 	if err != nil {
-		s.fail(span, w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "", nil)
+		s.fail(ctx, span, w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "", nil)
 		return
 	}
 	model, stream, err := openai.PeekRequest(body)
 	if err != nil {
-		s.fail(span, w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error", "", nil)
+		s.fail(ctx, span, w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error", "", nil)
 		return
 	}
 	if model == "" {
-		s.fail(span, w, http.StatusBadRequest, "missing model", "invalid_request_error", "", nil)
+		s.fail(ctx, span, w, http.StatusBadRequest, "missing model", "invalid_request_error", "", nil)
 		return
 	}
 	span.SetAttributes(
@@ -136,120 +159,115 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 4. Route.
 	pool, err := s.router.Resolve(model)
 	if err != nil {
-		s.fail(span, w, http.StatusNotFound, "no route for model "+model, "invalid_request_error", "model_not_found", nil)
+		s.fail(ctx, span, w, http.StatusNotFound, "no route for model "+model, "invalid_request_error", "model_not_found", nil)
 		return
 	}
 	span.SetAttributes(attribute.String("mortise.pool", pool.Name))
 
+	rs := &reqState{span: span, key: key, pool: pool, body: body, stream: stream, header: r.Header, start: start}
+
 	// 5. Idempotency dedup.
 	idemKey := r.Header.Get("Idempotency-Key")
 	if idemKey != "" {
-		s.serveWithDedup(ctx, span, w, key, pool, body, stream, idemKey, r.Header, start)
+		s.serveWithDedup(ctx, w, rs, idemKey)
 		return
 	}
-	s.execute(ctx, span, w, key, pool, body, stream, nil, r.Header, start)
+	s.execute(ctx, w, rs, nil)
 }
 
 // serveWithDedup coordinates leader/duplicate handling for an idempotency key.
-func (s *Server) serveWithDedup(ctx context.Context, span trace.Span, w http.ResponseWriter, key *config.Key, pool *config.Pool, body []byte, stream bool, idemKey string, clientHeader http.Header, start time.Time) {
-	dkey := key.Key + "\x00" + idemKey
+func (s *Server) serveWithDedup(ctx context.Context, w http.ResponseWriter, rs *reqState, idemKey string) {
+	dkey := rs.key.Key + "\x00" + idemKey
 	handle, leader := s.dedupe.Begin(dkey)
-	span.SetAttributes(attribute.String("mortise.idempotency_key", idemKey), attribute.Bool("mortise.dedup_leader", leader))
+	rs.span.SetAttributes(attribute.String("mortise.idempotency_key", idemKey), attribute.Bool("mortise.dedup_leader", leader))
 
 	if !leader {
 		// Duplicate: wait for the leader's captured response and replay it.
 		res := handle.Wait(ctx)
 		if res == nil {
-			s.fail(span, w, http.StatusBadGateway, "original request failed or was cancelled", "api_error", "dedup_no_result", nil)
+			s.fail(ctx, rs.span, w, http.StatusBadGateway, "original request failed or was cancelled", "api_error", "dedup_no_result", nil)
 			return
 		}
-		span.SetAttributes(attribute.Bool("mortise.replayed", true))
+		rs.span.SetAttributes(attribute.Bool("mortise.replayed", true))
 		replay(w, res)
-		s.tel.Requests.Add(ctx, 1, metricAttrs(key, pool, "replay"))
-		s.tel.Duration.Record(ctx, time.Since(start).Seconds(), metricAttrs(key, pool, "replay"))
+		s.tel.Requests.Add(ctx, 1, s.attrs(rs.key, rs.pool, "replay"))
+		s.tel.Duration.Record(ctx, time.Since(rs.start).Seconds(), s.attrs(rs.key, rs.pool, "replay"))
 		return
 	}
 	// Leader: run and capture. execute reports completion via the handle.
-	s.execute(ctx, span, w, key, pool, body, stream, handle, clientHeader, start)
+	s.execute(ctx, w, rs, handle)
 }
 
 // execute performs the upstream call, streams/buffers the response to the
 // client, does token accounting, and (if handle != nil) captures the response
 // for idempotent replay.
-func (s *Server) execute(ctx context.Context, span trace.Span, w http.ResponseWriter, key *config.Key, pool *config.Pool, body []byte, stream bool, handle *dedupe.EntryHandle, clientHeader http.Header, start time.Time) {
-	resp, err := s.proxy.Do(ctx, pool, body, clientHeader)
+func (s *Server) execute(ctx context.Context, w http.ResponseWriter, rs *reqState, handle *dedupe.EntryHandle) {
+	resp, err := s.proxy.Do(ctx, rs.pool, rs.body, rs.header)
 	if err != nil {
 		if handle != nil {
 			handle.Abort()
 		}
-		s.fail(span, w, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error", "upstream_error",
-			[]attribute.KeyValue{attribute.String("mortise.pool", pool.Name)})
+		s.fail(ctx, rs.span, w, http.StatusBadGateway, "upstream request failed: "+err.Error(), "api_error", "upstream_error",
+			[]attribute.KeyValue{attribute.String("mortise.pool", rs.pool.Name)})
 		return
 	}
 	defer resp.Body.Close()
-	span.SetAttributes(
+	rs.span.SetAttributes(
 		attribute.String("mortise.backend", resp.Backend),
 		attribute.Int("mortise.attempts", resp.Attempts),
 	)
 	if resp.Attempts > 1 {
-		s.tel.Retries.Add(ctx, int64(resp.Attempts-1), metricAttrs(key, pool, ""))
+		s.tel.Retries.Add(ctx, int64(resp.Attempts-1), s.attrs(rs.key, rs.pool, ""))
 	}
 
-	// Relay status + headers, then body (streaming with flush), capturing for dedup.
+	// Relay status + headers, then body (streaming with flush), capturing for
+	// dedup only when this is a leader.
 	copyHeader(w.Header(), resp.Header)
+	capturedHeader := http.Header(nil)
+	if handle != nil {
+		capturedHeader = cloneHeader(w.Header())
+	}
 	w.WriteHeader(resp.Status)
 
-	var captured *capture
-	if handle != nil {
-		captured = &capture{header: cloneHeader(w.Header()), status: resp.Status}
-	}
-	written, clientErr := relayBody(w, resp.Body)
+	rr := relay(w, resp.Body, rs.stream, handle != nil, s.maxCacheBody)
 
-	// Token accounting from the (fully captured or freshly parsed) body.
-	usage := extractUsage(written, stream)
-	if usage != nil {
-		s.limit.RecordTokens(key.Key, usage.TotalTokens)
-		s.tel.PromptTokens.Add(ctx, int64(usage.PromptTokens), metricAttrs(key, pool, ""))
-		s.tel.CompTokens.Add(ctx, int64(usage.CompletionTokens), metricAttrs(key, pool, ""))
-		span.SetAttributes(
-			attribute.Int("mortise.tokens.prompt", usage.PromptTokens),
-			attribute.Int("mortise.tokens.completion", usage.CompletionTokens),
+	// Token accounting.
+	if rr.usage != nil {
+		s.limit.RecordTokens(rs.key.Key, rr.usage.TotalTokens)
+		s.tel.PromptTokens.Add(ctx, int64(rr.usage.PromptTokens), s.attrs(rs.key, rs.pool, ""))
+		s.tel.CompTokens.Add(ctx, int64(rr.usage.CompletionTokens), s.attrs(rs.key, rs.pool, ""))
+		rs.span.SetAttributes(
+			attribute.Int("mortise.tokens.prompt", rr.usage.PromptTokens),
+			attribute.Int("mortise.tokens.completion", rr.usage.CompletionTokens),
 		)
 	}
 
-	// Finalize dedup: only cache a complete, client-delivered response.
+	// Finalize dedup: only cache a complete, client-delivered response that fit
+	// within the cache size limit (rr.cacheBody is nil otherwise).
 	if handle != nil {
-		if clientErr != nil {
+		if rr.clientErr != nil || rr.cacheBody == nil {
 			handle.Abort()
 		} else {
-			captured.body = written
-			handle.Complete(&dedupe.Result{Status: captured.status, Header: captured.header, Body: captured.body})
+			handle.Complete(&dedupe.Result{Status: resp.Status, Header: capturedHeader, Body: rr.cacheBody})
 		}
 	}
 
 	status := "ok"
 	if resp.Status >= 400 {
 		status = "upstream_error"
-		s.tel.Errors.Add(ctx, 1, metricAttrs(key, pool, ""))
-		span.SetStatus(codes.Error, "upstream status")
+		s.tel.Errors.Add(ctx, 1, s.attrs(rs.key, rs.pool, ""))
+		rs.span.SetStatus(codes.Error, "upstream status")
 	}
-	s.tel.Requests.Add(ctx, 1, metricAttrs(key, pool, status))
-	s.tel.Duration.Record(ctx, time.Since(start).Seconds(), metricAttrs(key, pool, status))
+	s.tel.Requests.Add(ctx, 1, s.attrs(rs.key, rs.pool, status))
+	s.tel.Duration.Record(ctx, time.Since(rs.start).Seconds(), s.attrs(rs.key, rs.pool, status))
 }
 
-// capture accumulates a response for idempotent replay.
-type capture struct {
-	status int
-	header http.Header
-	body   []byte
-}
-
-func (s *Server) fail(span trace.Span, w http.ResponseWriter, status int, msg, typ, code string, attrs []attribute.KeyValue) {
+func (s *Server) fail(ctx context.Context, span trace.Span, w http.ResponseWriter, status int, msg, typ, code string, attrs []attribute.KeyValue) {
 	if len(attrs) > 0 {
 		span.SetAttributes(attrs...)
 	}
 	span.SetStatus(codes.Error, msg)
-	s.tel.Errors.Add(context.Background(), 1)
+	s.tel.Errors.Add(ctx, 1)
 	writeError(w, status, msg, typ, code)
 }
 
@@ -259,7 +277,18 @@ func writeError(w http.ResponseWriter, status int, msg, typ, code string) {
 	_, _ = w.Write(openai.NewError(msg, typ, code))
 }
 
-func metricAttrs(key *config.Key, pool *config.Pool, result string) metric.MeasurementOption {
+// attrKey identifies a memoized metric attribute set.
+type attrKey struct {
+	key, pool, result string
+}
+
+// attrs returns a cached MeasurementOption for the given labels, building it
+// once per distinct combination.
+func (s *Server) attrs(key *config.Key, pool *config.Pool, result string) metric.MeasurementOption {
+	ak := attrKey{key: key.Name, pool: pool.Name, result: result}
+	if v, ok := s.attrCache.Load(ak); ok {
+		return v.(metric.MeasurementOption)
+	}
 	kv := []attribute.KeyValue{
 		attribute.String("key", key.Name),
 		attribute.String("pool", pool.Name),
@@ -267,7 +296,7 @@ func metricAttrs(key *config.Key, pool *config.Pool, result string) metric.Measu
 	if result != "" {
 		kv = append(kv, attribute.String("result", result))
 	}
-	return metric.WithAttributes(kv...)
+	opt := metric.WithAttributes(kv...)
+	actual, _ := s.attrCache.LoadOrStore(ak, opt)
+	return actual.(metric.MeasurementOption)
 }
-
-var _ = errors.Is // reserved for future typed error handling

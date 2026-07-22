@@ -56,9 +56,15 @@ func TestTokenBudget(t *testing.T) {
 	if l.AllowTokens("k1") {
 		t.Fatal("budget should be exhausted at limit")
 	}
-	// Roll over to next minute.
-	now = now.Add(time.Minute)
+	// Half a window later the previous window is weighted ~0.5, so ~50 tokens
+	// remain counted -> budget available again under the sliding window.
+	now = now.Add(90 * time.Second)
 	if !l.AllowTokens("k1") {
-		t.Fatal("budget should reset after a minute")
+		t.Fatal("budget should partially recover mid-window")
+	}
+	// Two full windows later the usage has fully aged out.
+	now = now.Add(2 * time.Minute)
+	if !l.AllowTokens("k1") {
+		t.Fatal("budget should reset after the window fully rolls over")
 	}
 }

@@ -33,8 +33,8 @@ type ChatResponse struct {
 	Usage *Usage `json:"usage"`
 }
 
-// PeekModel extracts just the model field from a raw request body without
-// fully unmarshalling it, returning stream too.
+// PeekRequest parses the fields mortise needs (model, stream) from a raw
+// request body, ignoring everything else. The body is still forwarded verbatim.
 func PeekRequest(body []byte) (model string, stream bool, err error) {
 	var r ChatRequest
 	if err := json.Unmarshal(body, &r); err != nil {
