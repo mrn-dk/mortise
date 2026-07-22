@@ -65,16 +65,3 @@ keys:
 go test -race ./...
 go generate ./...   # regenerate the OpenAPI docs after changing handlers
 ```
-
-## Releases
-
-mortise uses [Conventional Commits](https://www.conventionalcommits.org/) with
-[release-please](https://github.com/googleapis/release-please): merging to
-`main` maintains a release PR that tags `vX.Y.Z` and publishes cross-platform
-binaries via [GoReleaser](https://goreleaser.com). The version is embedded at
-build time (`mortise -version`).
-
-## Non-goals
-
-Prompt logic, guardrails, response caching beyond idempotent dedupe, and any
-coupling to specific agent frameworks. Egress is OpenAI-compatible backends only.
