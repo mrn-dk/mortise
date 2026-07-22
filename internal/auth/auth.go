@@ -2,25 +2,28 @@
 package auth
 
 import (
-	"context"
+	"crypto/sha256"
 	"net/http"
 	"strings"
 
 	"github.com/mrn-dk/mortise/internal/config"
 )
 
-type ctxKey struct{}
-
 // Authenticator validates client bearer tokens against configured keys.
+//
+// Tokens are looked up by their SHA-256 digest rather than by the raw secret.
+// Comparing fixed-size digests (instead of variable-length secrets via a map of
+// plaintext keys) avoids leaking, through timing, how much of a candidate key
+// matched a configured one.
 type Authenticator struct {
-	keys map[string]*config.Key
+	keys map[[32]byte]*config.Key
 }
 
 // New builds an Authenticator from config keys.
 func New(cfg *config.Config) *Authenticator {
-	m := make(map[string]*config.Key, len(cfg.Keys))
+	m := make(map[[32]byte]*config.Key, len(cfg.Keys))
 	for i := range cfg.Keys {
-		m[cfg.Keys[i].Key] = &cfg.Keys[i]
+		m[sha256.Sum256([]byte(cfg.Keys[i].Key))] = &cfg.Keys[i]
 	}
 	return &Authenticator{keys: m}
 }
@@ -31,7 +34,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (*config.Key, bool) {
 	if tok == "" {
 		return nil, false
 	}
-	k, ok := a.keys[tok]
+	k, ok := a.keys[sha256.Sum256([]byte(tok))]
 	return k, ok
 }
 
@@ -45,15 +48,4 @@ func bearer(r *http.Request) string {
 		return strings.TrimSpace(h[len(p):])
 	}
 	return strings.TrimSpace(h)
-}
-
-// FromContext returns the authenticated key stored on the request context.
-func FromContext(ctx context.Context) (*config.Key, bool) {
-	k, ok := ctx.Value(ctxKey{}).(*config.Key)
-	return k, ok
-}
-
-// WithKey stores the authenticated key on the context.
-func WithKey(ctx context.Context, k *config.Key) context.Context {
-	return context.WithValue(ctx, ctxKey{}, k)
 }
