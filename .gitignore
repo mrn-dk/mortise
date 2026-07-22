@@ -27,6 +27,11 @@ go.work.sum
 # env file
 .env
 
+# Live config may contain secrets; commit only mortise.example.yaml
+/mortise.yaml
+mortise.*.yaml
+!mortise.example.yaml
+
 # Editor/IDE
 # .idea/
 # .vscode/
