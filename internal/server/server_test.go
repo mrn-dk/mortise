@@ -297,3 +297,34 @@ func TestRetryAfterHonored(t *testing.T) {
 		t.Fatalf("want 2 upstream hits (retry), got %d", hits)
 	}
 }
+
+func TestDocsEndpoints(t *testing.T) {
+	cfg := baseConfig(
+		[]config.Pool{{Name: "p", Backends: []config.Backend{{BaseURL: "http://x/v1"}}}},
+		[]config.Route{{Model: "m", Pool: "p"}},
+	)
+	srv := httptest.NewServer(New(cfg, testTel(t)).Handler())
+	defer srv.Close()
+
+	// Spec is served without auth and is non-empty YAML.
+	resp, err := http.Get(srv.URL + "/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "openapi:") {
+		t.Fatalf("openapi.yaml: status=%d body=%.40q", resp.StatusCode, b)
+	}
+
+	// Swagger UI page renders and references the spec.
+	resp, err = http.Get(srv.URL + "/docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(b), "swagger-ui") {
+		t.Fatalf("/docs: status=%d", resp.StatusCode)
+	}
+}
