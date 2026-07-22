@@ -22,7 +22,7 @@ pools:
     backends:
       - name: openai
         base_url: https://api.openai.com/v1
-        api_key: "${OPENAI_API_KEY}"   # note: literal here; expand via env in your deploy
+        api_key: "${OPENAI_API_KEY}"   # ${VAR} references are expanded from the environment at load
 
 # Model-name routing: map the client-visible model to a pool.
 routes:
@@ -43,8 +43,10 @@ keys:
     rps: 5
 
 limits:
-  request_timeout: 60s         # default per-attempt timeout when a pool sets none
-  idempotency_ttl: 24h         # how long completed responses are cached for dedup
+  request_timeout: 60s              # default per-attempt timeout when a pool sets none
+  idempotency_ttl: 24h              # how long completed responses are cached for dedup
+  idempotency_max_entries: 10000    # LRU cap on cached idempotent responses
+  idempotency_max_body_bytes: 4194304  # 4 MiB; larger responses stream but aren't cached
 
 telemetry:
   service_name: mortise

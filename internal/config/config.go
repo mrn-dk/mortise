@@ -88,6 +88,12 @@ type Limits struct {
 	RequestTimeout time.Duration `yaml:"request_timeout"`
 	// IdempotencyTTL is how long a completed response is cached for dedup.
 	IdempotencyTTL time.Duration `yaml:"idempotency_ttl"`
+	// IdempotencyMaxEntries caps the number of cached idempotent responses
+	// (LRU eviction beyond this). 0 uses a built-in default.
+	IdempotencyMaxEntries int `yaml:"idempotency_max_entries"`
+	// IdempotencyMaxBodyBytes caps the size of a response that may be cached
+	// for replay; larger responses stream through but are not cached.
+	IdempotencyMaxBodyBytes int `yaml:"idempotency_max_body_bytes"`
 }
 
 // Telemetry configures OpenTelemetry export.
@@ -107,6 +113,8 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	// Expand ${VAR}/$VAR references (e.g. api keys) from the environment.
+	raw = []byte(os.ExpandEnv(string(raw)))
 	var c Config
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -127,6 +135,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Limits.IdempotencyTTL == 0 {
 		c.Limits.IdempotencyTTL = 24 * time.Hour
+	}
+	if c.Limits.IdempotencyMaxEntries == 0 {
+		c.Limits.IdempotencyMaxEntries = 10000
+	}
+	if c.Limits.IdempotencyMaxBodyBytes == 0 {
+		c.Limits.IdempotencyMaxBodyBytes = 4 << 20 // 4 MiB
 	}
 	if c.Telemetry.ServiceName == "" {
 		c.Telemetry.ServiceName = "mortise"
