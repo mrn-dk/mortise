@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -11,21 +10,63 @@ import (
 	"github.com/mrn-dk/mortise/internal/openai"
 )
 
-// relayBody streams src to the client, flushing for SSE, and returns the full
-// bytes seen (for token accounting and dedup capture). clientErr is non-nil if
-// writing to the client failed (e.g. disconnect) — in which case the captured
-// body is incomplete and must not be cached.
-func relayBody(w http.ResponseWriter, src io.Reader) (body []byte, clientErr error) {
+// relayResult reports the outcome of streaming an upstream body to the client.
+type relayResult struct {
+	// usage is the parsed token accounting, if the response carried any.
+	usage *openai.Usage
+	// cacheBody holds the full response for idempotent replay. It is non-nil
+	// only when capture was requested, the body fit within maxCache, and the
+	// client received it in full.
+	cacheBody []byte
+	// clientErr is non-nil if writing to the client failed (disconnect) or the
+	// upstream read errored mid-body — in which case the response is partial
+	// and must not be cached.
+	clientErr error
+}
+
+// relay streams src to the client, flushing for SSE. It extracts token usage
+// and — when capture is true and the body stays within maxCache — retains the
+// full body for idempotent replay.
+//
+// Memory: for streaming responses usage is parsed incrementally and nothing is
+// retained unless capture is set, so an unbounded SSE stream does not grow the
+// heap. Non-streaming bodies are buffered (bounded by the completion size) so
+// their top-level usage object can be parsed.
+func relay(w http.ResponseWriter, src io.Reader, stream, capture bool, maxCache int) relayResult {
 	flusher, _ := w.(http.Flusher)
-	var buf bytes.Buffer
-	r := bufio.NewReader(src)
+
+	var buf bytes.Buffer     // holds bytes we retain (capture and/or usage)
+	var sse *sseUsageScanner // incremental usage parser for streams
+	buffering := capture || !stream
+	if stream {
+		sse = &sseUsageScanner{}
+	}
+
+	res := relayResult{}
+	capReached := false
 	chunk := make([]byte, 32<<10)
 	for {
-		n, rerr := r.Read(chunk)
+		n, rerr := src.Read(chunk)
 		if n > 0 {
-			buf.Write(chunk[:n])
-			if _, werr := w.Write(chunk[:n]); werr != nil {
-				return buf.Bytes(), werr
+			p := chunk[:n]
+			if buffering {
+				buf.Write(p)
+				if capture && !capReached && buf.Len() > maxCache {
+					capReached = true // too big to cache
+					if stream {
+						// Usage comes from the incremental scanner; stop
+						// retaining the (now uncacheable) stream body.
+						buffering = false
+						buf.Reset()
+					}
+				}
+			}
+			if stream {
+				sse.write(p)
+			}
+			if _, werr := w.Write(p); werr != nil {
+				res.clientErr = werr
+				return res
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -35,12 +76,21 @@ func relayBody(w http.ResponseWriter, src io.Reader) (body []byte, clientErr err
 			break
 		}
 		if rerr != nil {
-			// Upstream read error: client got a partial body. Return the read
-			// error as clientErr so the response is not cached for replay.
-			return buf.Bytes(), rerr
+			// Partial body delivered; surface as clientErr so it is not cached.
+			res.clientErr = rerr
+			return res
 		}
 	}
-	return buf.Bytes(), nil
+
+	if stream {
+		res.usage = sse.usage()
+	} else {
+		res.usage = parseUsage(buf.Bytes())
+	}
+	if capture && !capReached {
+		res.cacheBody = buf.Bytes()
+	}
+	return res
 }
 
 // replay writes a previously captured response to a duplicate request's client.
@@ -51,43 +101,63 @@ func replay(w http.ResponseWriter, res *dedupe.Result) {
 	_, _ = w.Write(res.Body)
 }
 
-// extractUsage pulls token usage from a response body. For non-streaming
-// responses it reads the top-level usage object; for SSE it scans data frames
-// for the last one carrying a non-null usage (requires stream_options.include_usage).
-func extractUsage(body []byte, stream bool) *openai.Usage {
+// parseUsage reads the top-level usage object from a non-streaming response.
+func parseUsage(body []byte) *openai.Usage {
 	if len(body) == 0 {
 		return nil
 	}
-	if !stream {
-		var cr openai.ChatResponse
-		if err := json.Unmarshal(body, &cr); err != nil {
-			return nil
-		}
-		return cr.Usage
+	var cr openai.ChatResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return nil
 	}
-	var last *openai.Usage
-	sc := bufio.NewScanner(bytes.NewReader(body))
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
+	return cr.Usage
+}
+
+// sseUsageScanner extracts the last non-null usage object from an SSE stream,
+// tolerating chunk boundaries that split lines. It retains only the current
+// partial line plus the most recent usage — not the whole stream.
+type sseUsageScanner struct {
+	line bytes.Buffer
+	last *openai.Usage
+}
+
+func (s *sseUsageScanner) write(p []byte) {
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			s.line.Write(p)
+			return
 		}
-		payload := bytes.TrimSpace(line[len("data:"):])
-		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-			continue
-		}
-		var frame struct {
-			Usage *openai.Usage `json:"usage"`
-		}
-		if err := json.Unmarshal(payload, &frame); err != nil {
-			continue
-		}
-		if frame.Usage != nil {
-			last = frame.Usage
-		}
+		s.line.Write(p[:i])
+		s.processLine(s.line.Bytes())
+		s.line.Reset()
+		p = p[i+1:]
 	}
-	return last
+}
+
+func (s *sseUsageScanner) processLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return
+	}
+	var frame struct {
+		Usage *openai.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &frame); err == nil && frame.Usage != nil {
+		s.last = frame.Usage
+	}
+}
+
+func (s *sseUsageScanner) usage() *openai.Usage {
+	if s.line.Len() > 0 {
+		s.processLine(s.line.Bytes())
+		s.line.Reset()
+	}
+	return s.last
 }
 
 func copyHeader(dst, src http.Header) {

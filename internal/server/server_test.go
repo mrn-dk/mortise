@@ -220,3 +220,80 @@ func TestStreamingPassthrough(t *testing.T) {
 		t.Fatalf("stream not passed through: %s", b)
 	}
 }
+
+func TestStreamingTokenAccounting(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		// Split a data frame across writes to exercise chunk-boundary handling.
+		parts := []string{
+			`data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n",
+			`data: {"choices":[],"usage":{"prompt_to`,
+			`kens":7,"completion_tokens":3,"total_tokens":10}}` + "\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, p := range parts {
+			_, _ = io.WriteString(w, p)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := baseConfig(
+		[]config.Pool{{Name: "p", Backends: []config.Backend{{BaseURL: upstream.URL + "/v1"}}}},
+		[]config.Route{{Model: "m", Pool: "p"}},
+	)
+	// Give the key a token budget so RecordTokens has an effect we can observe.
+	cfg.Keys = []config.Key{{Key: "sk-test", Name: "test", RPS: 1000, Burst: 1000, TokensPerMin: 5}}
+	s := New(cfg, testTel(t))
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.DefaultClient.Do(chatReq(t, srv.URL, "sk-test", "", `{"model":"m","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(b), "[DONE]") {
+		t.Fatalf("stream not passed through: %s", b)
+	}
+	// 10 tokens recorded > budget of 5 -> next request denied by token gate.
+	if s.limit.AllowTokens("sk-test") {
+		t.Fatal("token budget should be exhausted after streaming usage was recorded")
+	}
+}
+
+func TestRetryAfterHonored(t *testing.T) {
+	var hits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, okBody)
+	}))
+	defer upstream.Close()
+
+	cfg := baseConfig(
+		[]config.Pool{{Name: "p", Retries: 1, Backends: []config.Backend{{BaseURL: upstream.URL + "/v1"}}}},
+		[]config.Route{{Model: "m", Pool: "p"}},
+	)
+	srv := httptest.NewServer(New(cfg, testTel(t)).Handler())
+	defer srv.Close()
+
+	resp, err := http.DefaultClient.Do(chatReq(t, srv.URL, "sk-test", "", `{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 after retry, got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&hits) != 2 {
+		t.Fatalf("want 2 upstream hits (retry), got %d", hits)
+	}
+}
