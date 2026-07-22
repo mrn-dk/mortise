@@ -46,7 +46,7 @@ func New(cfg *config.Config) *Limiter {
 			}
 			ks.limiter = rate.NewLimiter(rate.Limit(k.RPS), burst)
 		}
-		keys[k.Key] = ks
+		keys[k.Identity()] = ks
 	}
 	return &Limiter{keys: keys, now: time.Now}
 }

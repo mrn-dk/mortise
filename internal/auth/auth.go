@@ -3,6 +3,7 @@ package auth
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -19,11 +20,25 @@ type Authenticator struct {
 	keys map[[32]byte]*config.Key
 }
 
-// New builds an Authenticator from config keys.
+// New builds an Authenticator from config keys. Each key is indexed by the
+// SHA-256 digest of its plaintext token — computed here for plaintext keys, or
+// taken directly from the configured hash for key_sha256 entries (whose
+// plaintext mortise never sees).
 func New(cfg *config.Config) *Authenticator {
 	m := make(map[[32]byte]*config.Key, len(cfg.Keys))
 	for i := range cfg.Keys {
-		m[sha256.Sum256([]byte(cfg.Keys[i].Key))] = &cfg.Keys[i]
+		k := &cfg.Keys[i]
+		var digest [32]byte
+		if k.KeySHA256 != "" {
+			b, err := hex.DecodeString(k.KeySHA256)
+			if err != nil || len(b) != 32 {
+				continue // rejected by config.validate; skip defensively
+			}
+			copy(digest[:], b)
+		} else {
+			digest = sha256.Sum256([]byte(k.Key))
+		}
+		m[digest] = k
 	}
 	return &Authenticator{keys: m}
 }

@@ -163,13 +163,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	span.SetAttributes(attribute.String("mortise.key", key.Name))
 
 	// 2. Per-key RPS limit.
-	if !s.limit.AllowRequest(key.Key) {
+	if !s.limit.AllowRequest(key.Identity()) {
 		s.fail(ctx, span, w, http.StatusTooManyRequests, "rate limit exceeded", "rate_limit_error", "rate_limit_exceeded",
 			[]attribute.KeyValue{attribute.String("mortise.reject", "rps")})
 		return
 	}
 	// Per-key token budget (checked against the current window's usage).
-	if !s.limit.AllowTokens(key.Key) {
+	if !s.limit.AllowTokens(key.Identity()) {
 		s.fail(ctx, span, w, http.StatusTooManyRequests, "token quota exceeded", "rate_limit_error", "token_quota_exceeded",
 			[]attribute.KeyValue{attribute.String("mortise.reject", "tokens")})
 		return
@@ -216,7 +216,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // serveWithDedup coordinates leader/duplicate handling for an idempotency key.
 func (s *Server) serveWithDedup(ctx context.Context, w http.ResponseWriter, rs *reqState, idemKey string) {
-	dkey := rs.key.Key + "\x00" + idemKey
+	dkey := rs.key.Identity() + "\x00" + idemKey
 	handle, leader := s.dedupe.Begin(dkey)
 	rs.span.SetAttributes(attribute.String("mortise.idempotency_key", idemKey), attribute.Bool("mortise.dedup_leader", leader))
 
@@ -272,7 +272,7 @@ func (s *Server) execute(ctx context.Context, w http.ResponseWriter, rs *reqStat
 
 	// Token accounting.
 	if rr.usage != nil {
-		s.limit.RecordTokens(rs.key.Key, rr.usage.TotalTokens)
+		s.limit.RecordTokens(rs.key.Identity(), rr.usage.TotalTokens)
 		s.tel.PromptTokens.Add(ctx, int64(rr.usage.PromptTokens), s.attrs(rs.key, rs.pool, ""))
 		s.tel.CompTokens.Add(ctx, int64(rr.usage.CompletionTokens), s.attrs(rs.key, rs.pool, ""))
 		rs.span.SetAttributes(
