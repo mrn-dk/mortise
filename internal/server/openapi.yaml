@@ -1,0 +1,286 @@
+openapi: 3.0.3
+info:
+  title: mortise
+  description: |
+    A minimal, self-hosted OpenAI-compatible AI gateway. One socket fronts vLLM
+    fleets and external OpenAI-compatible endpoints, adding model-name routing,
+    retries/failover, per-key rate limits, token accounting, idempotent replay,
+    and OpenTelemetry — with no agent logic.
+
+    ### Authentication
+    All `/v1/*` endpoints require a client API key as a bearer token:
+    `Authorization: Bearer <key>`. Keys are defined in the mortise config.
+
+    ### Idempotency
+    Send an `Idempotency-Key` header on `POST /v1/chat/completions`. The first
+    request (the leader) is proxied upstream and its response captured; retries
+    with the same key replay that captured response (marked with
+    `Idempotency-Replayed: true`) instead of triggering a second, billable
+    upstream call.
+
+    ### Passthrough
+    Request and response bodies are OpenAI-compatible and forwarded largely
+    verbatim; mortise only inspects `model`, `stream`, and `usage`. Any
+    additional OpenAI fields you send are passed through unchanged.
+  version: 0.1.0
+  license:
+    name: See repository LICENSE
+servers:
+  - url: /
+    description: This mortise instance
+tags:
+  - name: Chat
+    description: OpenAI-compatible chat completions
+  - name: Models
+    description: Model discovery
+  - name: Health
+    description: Liveness
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [Chat]
+      summary: Create a chat completion
+      description: |
+        Routes the request to the pool serving `model`, applying per-key rate
+        and token limits, retries/failover, and (optionally) idempotent replay.
+        Supports Server-Sent Events streaming when `stream: true`.
+      operationId: createChatCompletion
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+            examples:
+              basic:
+                summary: Simple completion
+                value:
+                  model: llama-3.1-8b
+                  messages:
+                    - role: user
+                      content: Hello!
+              streaming:
+                summary: Streaming with usage
+                value:
+                  model: llama-3.1-8b
+                  stream: true
+                  stream_options:
+                    include_usage: true
+                  messages:
+                    - role: user
+                      content: Write a haiku about proxies.
+      responses:
+        '200':
+          description: |
+            The upstream response, forwarded verbatim. For non-streaming
+            requests this is `application/json`; for `stream: true` it is a
+            `text/event-stream` of OpenAI-shaped chunks terminated by
+            `data: [DONE]`.
+          headers:
+            Idempotency-Replayed:
+              description: Present and `true` when this response was replayed from a prior identical request.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream of `data:`-prefixed chunks.
+        '400':
+          description: Malformed request (invalid JSON, missing `model`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No route configured for the requested `model`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Per-key request-rate or token-budget limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: All upstream attempts failed, or an idempotent leader failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/models:
+    get:
+      tags: [Models]
+      summary: List available models
+      description: Lists the client-visible model names mortise is configured to route.
+      operationId: listModels
+      responses:
+        '200':
+          description: The list of routable models.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Always returns `200 ok` while the server is running. No auth required.
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: A client API key configured in mortise.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Opaque key that makes the request idempotent; retries replay the original response.
+      schema:
+        type: string
+        example: 3f1c9b2e-8a4d-4c0e-9d1a-1f2e3d4c5b6a
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      description: |
+        OpenAI-compatible chat request. Only `model`, `stream`, and
+        `stream_options` are inspected by mortise; all other OpenAI fields
+        (temperature, max_tokens, tools, …) are forwarded unchanged.
+      properties:
+        model:
+          type: string
+          description: Client-visible model name; must match a configured route.
+          example: llama-3.1-8b
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        stream:
+          type: boolean
+          default: false
+          description: When true, the response is streamed as Server-Sent Events.
+        stream_options:
+          type: object
+          properties:
+            include_usage:
+              type: boolean
+              description: Emit a final chunk carrying `usage` (required for streaming token accounting).
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+
+    ChatCompletionResponse:
+      type: object
+      additionalProperties: true
+      description: OpenAI-compatible chat completion (subset shown).
+      properties:
+        id:
+          type: string
+          example: chatcmpl-abc123
+        object:
+          type: string
+          example: chat.completion
+        model:
+          type: string
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+    ModelList:
+      type: object
+      properties:
+        object:
+          type: string
+          example: list
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    Model:
+      type: object
+      properties:
+        id:
+          type: string
+          example: llama-3.1-8b
+        object:
+          type: string
+          example: model
+        owned_by:
+          type: string
+          example: mortise
+
+    Error:
+      type: object
+      description: OpenAI-shaped error envelope.
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+              example: invalid_request_error
+            code:
+              type: string
+              nullable: true
+              example: invalid_api_key
