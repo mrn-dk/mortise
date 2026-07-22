@@ -32,14 +32,21 @@ routes:
     pool: openai-fallback
 
 # Client API keys with optional per-key limits.
+#
+# Prefer key_sha256 so the plaintext token never lives in this file:
+#   printf %s "sk-mortise-abc123" | sha256sum
+# mortise verifies clients against the digest; a leaked config exposes no
+# usable credential. Use `key:` (plaintext) only for local development, or
+# source it from the environment, e.g. `key: ${TEAM_AGENTS_KEY}`.
 keys:
   - name: team-agents
-    key: sk-mortise-abc123
+    # sha256 of "sk-mortise-abc123"
+    key_sha256: 08025e34ce34bca8a1cce8ec834cb543077299e62ffa8c9ccfca3d4437d42be1
     rps: 20                    # sustained requests/sec (0 = unlimited)
     burst: 40                  # token-bucket burst (defaults to ceil(rps))
     tokens_per_min: 200000     # rolling per-minute token budget (0 = unlimited)
   - name: readonly
-    key: sk-mortise-xyz789
+    key: sk-mortise-xyz789     # plaintext (dev only); prefer key_sha256 in production
     rps: 5
 
 limits:

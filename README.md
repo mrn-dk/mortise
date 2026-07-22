@@ -56,8 +56,22 @@ pools:
 routes:
   - { model: llama-3.1-8b, pool: llama-fleet }
 keys:
-  - { name: team-agents, key: sk-mortise-abc123, rps: 20, tokens_per_min: 200000 }
+  - { name: team-agents, key_sha256: 08025e34…42be1, rps: 20, tokens_per_min: 200000 }
 ```
+
+## Secrets
+
+The config carries two kinds of secret; keep neither in plaintext in version control:
+
+- **Client keys** (verified, not reproduced) — store the SHA-256 digest via
+  `key_sha256` so the raw token never touches disk. Generate one with
+  `printf %s "$TOKEN" | sha256sum`. (`key:` plaintext still works for local dev.)
+- **Backend `api_key`** (sent upstream verbatim, so it can't be hashed) — inject
+  it at runtime with `${ENV}` expansion from your secret manager, e.g.
+  `api_key: ${OPENAI_API_KEY}`.
+
+mortise warns if the config file is group/other-readable — keep it `0600`. Your
+live `mortise.yaml` is git-ignored; only `mortise.example.yaml` is committed.
 
 ## Development
 

@@ -3,8 +3,10 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -67,10 +69,17 @@ type Route struct {
 	Pool  string `yaml:"pool"`
 }
 
-// Key is a client credential with optional per-key limits.
+// Key is a client credential with optional per-key limits. Provide exactly one
+// of Key (plaintext) or KeySHA256 (the hex-encoded SHA-256 of the token, so the
+// raw secret never lives in the config file).
 type Key struct {
-	// Key is the secret bearer token presented by clients.
+	// Key is the secret bearer token presented by clients. Prefer KeySHA256 or
+	// a ${ENV} reference so plaintext secrets aren't stored at rest.
 	Key string `yaml:"key"`
+	// KeySHA256 is the lowercase hex SHA-256 digest of the bearer token. When
+	// set, mortise verifies clients against the digest and never sees the
+	// plaintext. Generate with: printf %s "$TOKEN" | sha256sum.
+	KeySHA256 string `yaml:"key_sha256"`
 	// Name is a human label for accounting/telemetry.
 	Name string `yaml:"name"`
 	// RPS is the sustained requests-per-second limit for this key. 0 = unlimited.
@@ -80,6 +89,17 @@ type Key struct {
 	// TokensPerMin caps total (prompt+completion) tokens per rolling minute.
 	// 0 = unlimited.
 	TokensPerMin int `yaml:"tokens_per_min"`
+}
+
+// Identity returns a stable, non-reversible-agnostic key used internally for
+// rate-limit and dedup namespacing. It never appears in logs or telemetry
+// (those use Name). For hashed keys it is the digest; for plaintext keys it is
+// the token itself (already in memory), so behaviour is identical either way.
+func (k *Key) Identity() string {
+	if k.KeySHA256 != "" {
+		return k.KeySHA256
+	}
+	return k.Key
 }
 
 // Limits holds global defaults.
@@ -112,6 +132,12 @@ func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	// Nudge operators away from world-readable secret files.
+	if info, statErr := os.Stat(path); statErr == nil {
+		if mode := info.Mode().Perm(); mode&0o077 != 0 {
+			fmt.Fprintf(os.Stderr, "mortise: warning: config %s is readable by group/other (mode %#o); tighten to 0600\n", path, mode)
+		}
 	}
 	// Expand ${VAR}/$VAR references (e.g. api keys) from the environment.
 	raw = []byte(os.ExpandEnv(string(raw)))
@@ -151,6 +177,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	for i := range c.Keys {
+		c.Keys[i].KeySHA256 = strings.ToLower(strings.TrimSpace(c.Keys[i].KeySHA256))
 		if c.Keys[i].Burst == 0 && c.Keys[i].RPS > 0 {
 			c.Keys[i].Burst = int(c.Keys[i].RPS)
 			if c.Keys[i].Burst < 1 {
@@ -202,8 +229,18 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: at least one key is required")
 	}
 	for i, k := range c.Keys {
-		if k.Key == "" {
-			return fmt.Errorf("config: key %d has empty value", i)
+		switch {
+		case k.Key == "" && k.KeySHA256 == "":
+			return fmt.Errorf("config: key %d must set key or key_sha256", i)
+		case k.Key != "" && k.KeySHA256 != "":
+			return fmt.Errorf("config: key %d sets both key and key_sha256 (choose one)", i)
+		case k.KeySHA256 != "":
+			if len(k.KeySHA256) != 64 {
+				return fmt.Errorf("config: key %d key_sha256 must be a 64-char hex sha-256 digest", i)
+			}
+			if _, err := hex.DecodeString(k.KeySHA256); err != nil {
+				return fmt.Errorf("config: key %d key_sha256 is not valid hex: %w", i, err)
+			}
 		}
 	}
 	return nil
