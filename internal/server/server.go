@@ -70,14 +70,34 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.registerDocs(mux)
 	return mux
 }
 
+// handleHealth is the liveness probe.
+//
+// @Summary      Liveness probe
+// @Description  Always returns 200 while the server is running. No auth required.
+// @Tags         Health
+// @Produce      plain
+// @Success      200  {string}  string  "ok"
+// @Router       /healthz [get]
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleModels lists the routable models.
+//
+// @Summary      List available models
+// @Description  Lists the client-visible model names mortise is configured to route.
+// @Tags         Models
+// @Produce      json
+// @Success      200  {object}  ModelList
+// @Failure      401  {object}  ErrorResponse
+// @Security     BearerAuth
+// @Router       /v1/models [get]
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.auth.Authenticate(r); !ok {
 		writeError(w, http.StatusUnauthorized, "invalid api key", "invalid_request_error", "invalid_api_key")
@@ -111,6 +131,24 @@ type reqState struct {
 	start  time.Time
 }
 
+// handleChat proxies an OpenAI-compatible chat completion.
+//
+// @Summary      Create a chat completion
+// @Description  Routes to the pool serving `model`, applying per-key rate/token limits, retries/failover, and optional idempotent replay. Supports SSE when `stream` is true.
+// @Tags         Chat
+// @Accept       json
+// @Produce      json
+// @Produce      text/event-stream
+// @Param        Idempotency-Key  header  string                 false  "Makes the request idempotent; retries replay the original response"
+// @Param        request          body    ChatCompletionRequest  true   "OpenAI-compatible chat request"
+// @Success      200  {object}  ChatCompletionResponse
+// @Failure      400  {object}  ErrorResponse
+// @Failure      401  {object}  ErrorResponse
+// @Failure      404  {object}  ErrorResponse
+// @Failure      429  {object}  ErrorResponse
+// @Failure      502  {object}  ErrorResponse
+// @Security     BearerAuth
+// @Router       /v1/chat/completions [post]
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctx, span := s.tel.Tracer.Start(r.Context(), "chat.completions")

@@ -1,0 +1,198 @@
+basePath: /
+definitions:
+  server.ChatCompletionRequest:
+    properties:
+      messages:
+        items:
+          $ref: '#/definitions/server.ChatMessage'
+        type: array
+      model:
+        example: llama-3.1-8b
+        type: string
+      stream:
+        type: boolean
+      stream_options:
+        $ref: '#/definitions/server.StreamOptions'
+    type: object
+  server.ChatCompletionResponse:
+    properties:
+      id:
+        example: chatcmpl-abc123
+        type: string
+      model:
+        example: llama-3.1-8b
+        type: string
+      object:
+        example: chat.completion
+        type: string
+      usage:
+        $ref: '#/definitions/server.UsageBlock'
+    type: object
+  server.ChatMessage:
+    properties:
+      content:
+        example: Hello!
+        type: string
+      role:
+        enum:
+        - system
+        - user
+        - assistant
+        - tool
+        example: user
+        type: string
+    type: object
+  server.ErrorDetail:
+    properties:
+      code:
+        example: invalid_api_key
+        type: string
+      message:
+        example: invalid api key
+        type: string
+      type:
+        example: invalid_request_error
+        type: string
+    type: object
+  server.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/server.ErrorDetail'
+    type: object
+  server.ModelDoc:
+    properties:
+      id:
+        example: llama-3.1-8b
+        type: string
+      object:
+        example: model
+        type: string
+      owned_by:
+        example: mortise
+        type: string
+    type: object
+  server.ModelList:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/server.ModelDoc'
+        type: array
+      object:
+        example: list
+        type: string
+    type: object
+  server.StreamOptions:
+    properties:
+      include_usage:
+        description: |-
+          IncludeUsage emits a final chunk carrying usage (needed for streaming
+          token accounting).
+        type: boolean
+    type: object
+  server.UsageBlock:
+    properties:
+      completion_tokens:
+        type: integer
+      prompt_tokens:
+        type: integer
+      total_tokens:
+        type: integer
+    type: object
+info:
+  contact: {}
+  description: |-
+    A minimal, self-hosted OpenAI-compatible AI gateway: model-name routing, retries/failover, per-key limits, token accounting, idempotent replay, and OpenTelemetry.
+    Bodies are OpenAI-compatible and forwarded verbatim; mortise only inspects model, stream, and usage.
+  title: mortise
+  version: 0.1.0
+paths:
+  /healthz:
+    get:
+      description: Always returns 200 while the server is running. No auth required.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+      summary: Liveness probe
+      tags:
+      - Health
+  /v1/chat/completions:
+    post:
+      consumes:
+      - application/json
+      description: Routes to the pool serving `model`, applying per-key rate/token
+        limits, retries/failover, and optional idempotent replay. Supports SSE when
+        `stream` is true.
+      parameters:
+      - description: Makes the request idempotent; retries replay the original response
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: OpenAI-compatible chat request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.ChatCompletionRequest'
+      produces:
+      - application/json
+      - text/event-stream
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.ChatCompletionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Create a chat completion
+      tags:
+      - Chat
+  /v1/models:
+    get:
+      description: Lists the client-visible model names mortise is configured to route.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/server.ModelList'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/server.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List available models
+      tags:
+      - Models
+securityDefinitions:
+  BearerAuth:
+    description: Client API key presented as "Bearer <key>".
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

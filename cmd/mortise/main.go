@@ -1,5 +1,15 @@
 // Command mortise is a minimal, self-hosted OpenAI-compatible reverse proxy
 // fronting vLLM fleets and external OpenAI-compatible endpoints.
+//
+// @title                       mortise
+// @version                     0.1.0
+// @description                 A minimal, self-hosted OpenAI-compatible AI gateway: model-name routing, retries/failover, per-key limits, token accounting, idempotent replay, and OpenTelemetry.
+// @description                 Bodies are OpenAI-compatible and forwarded verbatim; mortise only inspects model, stream, and usage.
+// @BasePath                    /
+// @securityDefinitions.apikey  BearerAuth
+// @in                          header
+// @name                        Authorization
+// @description                 Client API key presented as "Bearer <key>".
 package main
 
 import (
